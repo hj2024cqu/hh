@@ -1,0 +1,31 @@
+======================================================================
+2:4 Sparse + Shared Exponent Quantization V4
+Row block size: 2048 (-1 = full column)
+Mantissa bits: 5
+Skip mantissa quant: True
+Sort by magnitude: True
+Mantissa quant granularity: element
+Enable swap: True
+======================================================================
+Model: /home/LHZ/opt/code/sparsegpt/compressed_models/stage1_pruned
+Tokenizer: /home/LHZ/opt/model/opt-6.7b
+
+Loading model...
+Traceback (most recent call last):
+  File "/home/LHZ/opt/code/sparsegpt/opt_shared_exp_swap.py", line 1319, in <module>
+    model = get_opt(args.model)
+  File "/home/LHZ/opt/code/sparsegpt/opt_shared_exp_swap.py", line 33, in get_opt
+    model = OPTForCausalLM.from_pretrained(model_path, torch_dtype='auto')
+  File "/home/LHZ/anaconda3/envs/hh/lib/python3.10/site-packages/transformers/modeling_utils.py", line 3480, in from_pretrained
+    ) = cls._load_pretrained_model(
+  File "/home/LHZ/anaconda3/envs/hh/lib/python3.10/site-packages/transformers/modeling_utils.py", line 3734, in _load_pretrained_model
+    model.apply(model._initialize_weights)
+  File "/home/LHZ/anaconda3/envs/hh/lib/python3.10/site-packages/torch/nn/modules/module.py", line 897, in apply
+    module.apply(fn)
+  File "/home/LHZ/anaconda3/envs/hh/lib/python3.10/site-packages/torch/nn/modules/module.py", line 898, in apply
+    fn(self)
+  File "/home/LHZ/anaconda3/envs/hh/lib/python3.10/site-packages/transformers/modeling_utils.py", line 1390, in _initialize_weights
+    self._init_weights(module)
+  File "/home/LHZ/anaconda3/envs/hh/lib/python3.10/site-packages/transformers/models/opt/modeling_opt.py", line 375, in _init_weights
+    module.weight.data.normal_(mean=0.0, std=std)
+KeyboardInterrupt
