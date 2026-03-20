@@ -14,13 +14,7 @@
   - 可选多进程 (--workers)
 
 使用方法:
-    python analyze_shared_exp_fast.py /path/to/pruned_model \\
-        --mantissa_bits 4 --row_block_size -1 \\
-        --output_dir ./analysis_results
-
-    python analyze_shared_exp_fast.py /path/to/pruned_model \\
-        --mantissa_bits 4 --row_block_size 128 \\
-        --output_dir ./analysis_rbs128 --layers 30
+python test.py /home/hej/model/float/stage1_pruned --mantissa_bits 4 --row_block_size 128 --output_dir /home/hej/model/float/sparsegpt/compressed_128_4bits/mantissa_4bit 
 """
 
 import os
