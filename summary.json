@@ -1,0 +1,196 @@
+{
+  "config": {
+    "model": "/home/hej/model/float/stage1_pruned",
+    "mantissa_bits": 4,
+    "row_block_size": -1,
+    "row_block_size_desc": "整列共享",
+    "skip_mantissa_quant": false,
+    "analyzed_layers": "all",
+    "sharing_direction": {
+      "column": "每4列为一个 column_group (num_groups = cols/4)",
+      "row": "每 整列共享 共享同一 D0/D1 码表",
+      "codebook_key": "(column_group, row_block)",
+      "codebook_content": "D0: 4个指数, D1: 4个指数, 各需2bit索引"
+    }
+  },
+  "global_d0_patterns": {
+    "1-1-1": {
+      "count": 288804,
+      "frequency": 0.979289,
+      "pct": "97.93%"
+    },
+    "1-1-2": {
+      "count": 2258,
+      "frequency": 0.007657,
+      "pct": "0.77%"
+    },
+    "1-1-4": {
+      "count": 1716,
+      "frequency": 0.005819,
+      "pct": "0.58%"
+    },
+    "1-1-3": {
+      "count": 1542,
+      "frequency": 0.005229,
+      "pct": "0.52%"
+    },
+    "1-1-5": {
+      "count": 520,
+      "frequency": 0.001763,
+      "pct": "0.18%"
+    },
+    "1-4-2": {
+      "count": 39,
+      "frequency": 0.000132,
+      "pct": "0.01%"
+    },
+    "1-5-2": {
+      "count": 12,
+      "frequency": 4.1e-05,
+      "pct": "0.00%"
+    },
+    "1-5-1": {
+      "count": 8,
+      "frequency": 2.7e-05,
+      "pct": "0.00%"
+    },
+    "1-1-6": {
+      "count": 6,
+      "frequency": 2e-05,
+      "pct": "0.00%"
+    },
+    "1-4-3": {
+      "count": 2,
+      "frequency": 7e-06,
+      "pct": "0.00%"
+    },
+    "2-1-1": {
+      "count": 2,
+      "frequency": 7e-06,
+      "pct": "0.00%"
+    },
+    "1-3-3": {
+      "count": 1,
+      "frequency": 3e-06,
+      "pct": "0.00%"
+    },
+    "1-2-3": {
+      "count": 1,
+      "frequency": 3e-06,
+      "pct": "0.00%"
+    },
+    "2-1-3": {
+      "count": 1,
+      "frequency": 3e-06,
+      "pct": "0.00%"
+    }
+  },
+  "global_d1_patterns": {
+    "1-1-1": {
+      "count": 286416,
+      "frequency": 0.971191,
+      "pct": "97.12%"
+    },
+    "2-1-1": {
+      "count": 4025,
+      "frequency": 0.013648,
+      "pct": "1.36%"
+    },
+    "1-1-4": {
+      "count": 2009,
+      "frequency": 0.006812,
+      "pct": "0.68%"
+    },
+    "1-1-3": {
+      "count": 1269,
+      "frequency": 0.004303,
+      "pct": "0.43%"
+    },
+    "1-1-5": {
+      "count": 679,
+      "frequency": 0.002302,
+      "pct": "0.23%"
+    },
+    "1-1-2": {
+      "count": 283,
+      "frequency": 0.00096,
+      "pct": "0.10%"
+    },
+    "1-1-6": {
+      "count": 83,
+      "frequency": 0.000281,
+      "pct": "0.03%"
+    },
+    "1-5-2": {
+      "count": 73,
+      "frequency": 0.000248,
+      "pct": "0.02%"
+    },
+    "1-4-2": {
+      "count": 28,
+      "frequency": 9.5e-05,
+      "pct": "0.01%"
+    },
+    "1-5-1": {
+      "count": 10,
+      "frequency": 3.4e-05,
+      "pct": "0.00%"
+    },
+    "4-1-1": {
+      "count": 9,
+      "frequency": 3.1e-05,
+      "pct": "0.00%"
+    },
+    "1-4-3": {
+      "count": 8,
+      "frequency": 2.7e-05,
+      "pct": "0.00%"
+    },
+    "3-1-1": {
+      "count": 8,
+      "frequency": 2.7e-05,
+      "pct": "0.00%"
+    },
+    "2-2-1": {
+      "count": 4,
+      "frequency": 1.4e-05,
+      "pct": "0.00%"
+    },
+    "1-1-7": {
+      "count": 3,
+      "frequency": 1e-05,
+      "pct": "0.00%"
+    },
+    "1-6-1": {
+      "count": 2,
+      "frequency": 7e-06,
+      "pct": "0.00%"
+    },
+    "1-2-1": {
+      "count": 2,
+      "frequency": 7e-06,
+      "pct": "0.00%"
+    },
+    "2-1-2": {
+      "count": 1,
+      "frequency": 3e-06,
+      "pct": "0.00%"
+    }
+  },
+  "global_d0_base_distribution": {
+    "-10": 1,
+    "-9": 5808,
+    "-8": 189088,
+    "-7": 99944,
+    "-6": 71
+  },
+  "global_d1_base_distribution": {
+    "-13": 1,
+    "-12": 18,
+    "-11": 81,
+    "-10": 9281,
+    "-9": 186368,
+    "-8": 99163
+  },
+  "total_time_seconds": 7227.9
+}
