@@ -1,20 +1,27 @@
 #!/usr/bin/env python3
 """
-分析 2:4 剪枝 + 共享指数量化模型
+分析 2:4 剪枝 + 共享指数量化模型 (带 checkpoint)
 =========================================================
 功能:
   1. 稀疏性检查 (2:4 结构验证)
-  2. 生成 mask 表和指数选取表 (JSON + .pt)
+  2. 生成 mask 表和指数选取表 (.pt, int8)
   3. 指数选取模式频率统计 (JSON)
+  4. 每 N 层自动 checkpoint, 支持断点续跑
+
+输出格式 (兼容 pack.py v2):
+  - codebook_tables.pt : dict{ tensor_name → int8 tensor [num_groups, num_rb, 2, 4] }
+  - sparse_masks.pt    : dict{ tensor_name → int8 tensor [rows, num_groups, 2] }
+  - pattern_analysis.json / sparsity_check.json / summary.json
 
 加速手段 (零精度损失):
   - C(n,4) 枚举: 预生成 combo 索引张量, GPU batch min/sum 替代 Python 循环
   - log2 / Counter: 一次性批量计算所有 (group, row_block)
   - combo 索引缓存: 同一 n_cand 只生成一次
-  - 可选多进程 (--workers)
 
 使用方法:
-python test.py /home/hej/model/float/stage1_pruned --mantissa_bits 4 --row_block_size 128 --output_dir /home/hej/model/float/sparsegpt/compressed_128_4bits/mantissa_4bit 
+python test.py /home/hej/model/float/stage1_pruned --mantissa_bits 4 --row_block_size 128 \
+    --output_dir /home/hej/model/float/sparsegpt/compressed_128_4bits/mantissa_4bit \
+    --checkpoint_every 4
 """
 
 import os
@@ -54,18 +61,13 @@ def find_layers(module, layers=[nn.Linear], name=''):
 
 
 # ======================================================================
-# Combo 索引缓存 
+# Combo 索引缓存
 # ======================================================================
 
-# 全局缓存: n_cand → LongTensor [C(n,4), 4] on device
 _combo_cache = {}
 
 
 def get_combo_tensor(n_cand, device):
-    """
-    获取 C(n_cand, 4) 的所有组合索引张量, 缓存到 GPU。
-    n=5 → 5种, n=12 → 495种。
-    """
     key = (n_cand, device)
     if key not in _combo_cache:
         combos = list(combinations(range(n_cand), 4))
@@ -79,7 +81,6 @@ def get_combo_tensor(n_cand, device):
 
 def select_top4_bruteforce_fast(vals, valid_mask, mantissa_bits=4,
                                 skip_mantissa_quant=False, device='cpu'):
-
     v = vals[valid_mask]
     if len(v) == 0:
         return [-8, -7, -6, -5]
@@ -102,9 +103,9 @@ def select_top4_bruteforce_fast(vals, valid_mask, mantissa_bits=4,
 
     n_cand = len(unique_exps)
     cand_exp = torch.tensor(unique_exps, dtype=torch.float32, device=device)
-    cand_scales = 2.0 ** cand_exp  # [n_cand]
+    cand_scales = 2.0 ** cand_exp
 
-    mantissas = abs_v.unsqueeze(0) / cand_scales.unsqueeze(1)  # [n_cand, M]
+    mantissas = abs_v.unsqueeze(0) / cand_scales.unsqueeze(1)
     clamped = torch.clamp(mantissas, 1.0, 2.0 - 1e-7)
 
     if skip_mantissa_quant:
@@ -115,18 +116,12 @@ def select_top4_bruteforce_fast(vals, valid_mask, mantissa_bits=4,
         qm = torch.clamp(qm, 1.0, 2.0 - step)
 
     recon = qm * cand_scales.unsqueeze(1)
-    per_exp_errors = torch.abs(abs_v.unsqueeze(0) - recon)  # [n_cand, M]
+    per_exp_errors = torch.abs(abs_v.unsqueeze(0) - recon)
 
-    combo_idx = get_combo_tensor(n_cand, device)  # [num_combos, 4]
-    num_combos = combo_idx.shape[0]
-
-    # 索引: [num_combos, 4, M]
-    combo_errors = per_exp_errors[combo_idx]  # advanced indexing → [num_combos, 4, M]
-    # 每个 combo 对每个元素取最优指数: [num_combos, M]
+    combo_idx = get_combo_tensor(n_cand, device)
+    combo_errors = per_exp_errors[combo_idx]
     min_errors, _ = combo_errors.min(dim=1)
-    # 每个 combo 的总误差: [num_combos]
     total_costs = min_errors.sum(dim=1)
-    # 最优 combo
     best_idx = total_costs.argmin().item()
     best_combo = combo_idx[best_idx].cpu().tolist()
 
@@ -146,14 +141,10 @@ def classify_pattern(exp_list):
 
 
 # ======================================================================
-# 批量预计算: D0/D1 值 + 指数 (一次性, 避免重复 log2)
+# 批量预计算: D0/D1 值 + 指数
 # ======================================================================
 
 def precompute_d0_d1(W_g, nz_g, valid_row_mask, device):
-    """
-    一次性计算所有 (row, group) 的 D0/D1 值、位置、指数。
-    返回的张量均为 [rows, num_groups]。
-    """
     rows, num_groups, _ = W_g.shape
 
     pos_t = torch.arange(4, device=device).view(1, 1, 4).expand(rows, num_groups, 4)
@@ -176,7 +167,6 @@ def precompute_d0_d1(W_g, nz_g, valid_row_mask, device):
     pos_d0 = torch.where(need_sort, pos1, pos0)
     pos_d1 = torch.where(need_sort, pos0, pos1)
 
-    # 批量 log2 (全张量一次算完, 避免逐 group 重复算)
     exp_d0_all = torch.floor(torch.log2(torch.abs(val_d0).clamp(min=1e-38))).int()
     exp_d1_all = torch.floor(torch.log2(torch.abs(val_d1).clamp(min=1e-38))).int()
 
@@ -184,14 +174,10 @@ def precompute_d0_d1(W_g, nz_g, valid_row_mask, device):
 
 
 # ======================================================================
-# 快速 Counter: 从预计算的整数指数张量中提取
+# 快速 Counter
 # ======================================================================
 
 def fast_counter(exp_slice):
-    """
-    从一个 1D int tensor 快速构建 Counter。
-    用 torch.unique + counts, 比逐元素 tolist() + Counter 快。
-    """
     if len(exp_slice) == 0:
         return Counter()
     uniq, cnts = torch.unique(exp_slice, return_counts=True)
@@ -204,14 +190,6 @@ def fast_counter(exp_slice):
 
 def select_top4_with_precomputed(vals_slice, exp_int_slice, valid_slice,
                                   mantissa_bits, skip_mantissa_quant, device):
-    """
-    与 select_top4_bruteforce_fast 等价, 但接受预计算的整数指数,
-    避免重复 log2 + tolist。
-
-    vals_slice:     [N] float32 值
-    exp_int_slice:  [N] int32 预计算指数
-    valid_slice:    [N] bool
-    """
     v = vals_slice[valid_slice]
     if len(v) == 0:
         return [-8, -7, -6, -5]
@@ -249,7 +227,6 @@ def select_top4_with_precomputed(vals_slice, exp_int_slice, valid_slice,
     recon = qm * cand_scales.unsqueeze(1)
     per_exp_errors = torch.abs(abs_v.unsqueeze(0) - recon)
 
-    # 向量化枚举
     combo_idx = get_combo_tensor(n_cand, device)
     combo_errors = per_exp_errors[combo_idx]
     min_errors, _ = combo_errors.min(dim=1)
@@ -329,10 +306,13 @@ def analyze_tensor(tensor_name, W, mantissa_bits=4, row_block_size=-1,
     val_d0, val_d1, pos_d0, pos_d1, exp_d0_all, exp_d1_all = \
         precompute_d0_d1(W_g, nz_g, valid_row_mask, device)
 
+    # mask: [rows, num_groups, 2], int8 — 直接兼容 pack.py v1 格式
     mask_tensor = torch.stack([pos_d0, pos_d1], dim=2).to(torch.int8).cpu()
 
     # =================== 3. 指数选取 ===================
-    codebook_info = {}
+    # codebook tensor: [num_groups, num_rb, 2, 4], int8 — 兼容 pack.py v2 格式
+    codebook_tensor = torch.zeros(num_groups, num_rb, 2, 4, dtype=torch.int8)
+
     d0_patterns_counter = Counter()
     d1_patterns_counter = Counter()
     d0_pattern_examples = {}
@@ -361,7 +341,6 @@ def analyze_tensor(tensor_name, W, mantissa_bits=4, row_block_size=-1,
             ed0_pre = exp_d0_all[rs:re, g]
             ed1_pre = exp_d1_all[rs:re, g]
 
-            # 用预计算指数的快速版本
             exp_d0 = select_top4_with_precomputed(
                 vd0, ed0_pre, vm, mantissa_bits, skip_mantissa_quant, device)
             exp_d1 = select_top4_with_precomputed(
@@ -370,9 +349,11 @@ def analyze_tensor(tensor_name, W, mantissa_bits=4, row_block_size=-1,
             if exp_d0 == exp_d1:
                 exp_d1 = [e - 1 for e in exp_d1]
 
-            codebook_info[(g, rb)] = {"d0": exp_d0, "d1": exp_d1}
+            # 写入 codebook tensor (int8, 范围 -128~127, 指数一般在此范围内)
+            codebook_tensor[g, rb, 0, :] = torch.tensor(sorted(exp_d0), dtype=torch.int8)
+            codebook_tensor[g, rb, 1, :] = torch.tensor(sorted(exp_d1), dtype=torch.int8)
 
-            # 指数分布统计 (直接用预计算的整数指数, 不再重复 log2)
+            # 指数分布统计
             e0_valid = ed0_pre[vm]
             e1_valid = ed1_pre[vm]
             if len(e0_valid) > 0:
@@ -446,7 +427,87 @@ def analyze_tensor(tensor_name, W, mantissa_bits=4, row_block_size=-1,
             "examples": d1_pattern_examples.get(pat, [])
         }
 
-    return sparsity_info, codebook_info, pattern_info, mask_tensor
+    return sparsity_info, codebook_tensor, pattern_info, mask_tensor
+
+
+# ======================================================================
+# Checkpoint 存/读
+# ======================================================================
+
+CHECKPOINT_FILE = 'checkpoint_state.pt'
+
+
+def save_checkpoint(output_dir, completed_layers, all_sparsity, all_patterns,
+                    all_codebooks_pt, all_masks_pt):
+    """
+    增量保存 checkpoint:
+      - codebook_tables.pt : dict{ tensor_name → int8 [G, RB, 2, 4] }
+      - sparse_masks.pt    : dict{ tensor_name → int8 [rows, G, 2] }
+      - sparsity_check.json
+      - pattern_analysis.json
+      - checkpoint_state.pt : 记录已完成的层号列表
+    """
+    # codebook .pt
+    cb_path = os.path.join(output_dir, 'codebook_tables.pt')
+    torch.save(all_codebooks_pt, cb_path)
+
+    # mask .pt
+    mask_path = os.path.join(output_dir, 'sparse_masks.pt')
+    torch.save(all_masks_pt, mask_path)
+
+    # sparsity json
+    sp_path = os.path.join(output_dir, 'sparsity_check.json')
+    with open(sp_path, 'w', encoding='utf-8') as f:
+        json.dump(all_sparsity, f, indent=2, ensure_ascii=False)
+
+    # pattern json
+    pat_path = os.path.join(output_dir, 'pattern_analysis.json')
+    with open(pat_path, 'w', encoding='utf-8') as f:
+        json.dump(all_patterns, f, indent=2, ensure_ascii=False)
+
+    # checkpoint meta
+    ckpt_path = os.path.join(output_dir, CHECKPOINT_FILE)
+    torch.save({'completed_layers': sorted(completed_layers)}, ckpt_path)
+
+    print(f'  [Checkpoint] 已保存, 完成层: {sorted(completed_layers)}')
+
+
+def load_checkpoint(output_dir):
+    """
+    尝试加载已有 checkpoint, 返回已完成的层号集合和已有数据。
+    如果不存在则返回空。
+    """
+    ckpt_path = os.path.join(output_dir, CHECKPOINT_FILE)
+    if not os.path.exists(ckpt_path):
+        return set(), {}, {}, {}, {}
+
+    meta = torch.load(ckpt_path, map_location='cpu')
+    completed = set(meta.get('completed_layers', []))
+
+    all_sparsity = {}
+    sp_path = os.path.join(output_dir, 'sparsity_check.json')
+    if os.path.exists(sp_path):
+        with open(sp_path, 'r', encoding='utf-8') as f:
+            all_sparsity = json.load(f)
+
+    all_patterns = {}
+    pat_path = os.path.join(output_dir, 'pattern_analysis.json')
+    if os.path.exists(pat_path):
+        with open(pat_path, 'r', encoding='utf-8') as f:
+            all_patterns = json.load(f)
+
+    all_codebooks_pt = {}
+    cb_path = os.path.join(output_dir, 'codebook_tables.pt')
+    if os.path.exists(cb_path):
+        all_codebooks_pt = torch.load(cb_path, map_location='cpu')
+
+    all_masks_pt = {}
+    mask_path = os.path.join(output_dir, 'sparse_masks.pt')
+    if os.path.exists(mask_path):
+        all_masks_pt = torch.load(mask_path, map_location='cpu')
+
+    print(f'  [Checkpoint] 已恢复, 完成层: {sorted(completed)}')
+    return completed, all_sparsity, all_patterns, all_codebooks_pt, all_masks_pt
 
 
 # ======================================================================
@@ -455,7 +516,7 @@ def analyze_tensor(tensor_name, W, mantissa_bits=4, row_block_size=-1,
 
 def main():
     parser = argparse.ArgumentParser(
-        description='分析 2:4 剪枝模型 (加速版)')
+        description='分析 2:4 剪枝模型 (加速版, 带 checkpoint)')
     parser.add_argument('model', type=str)
     parser.add_argument('--mantissa_bits', type=int, default=4)
     parser.add_argument('--row_block_size', type=int, default=-1,
@@ -464,8 +525,10 @@ def main():
     parser.add_argument('--output_dir', type=str, default='./analysis_results')
     parser.add_argument('--device', type=str, default='cuda:0')
     parser.add_argument('--layers', type=int, nargs='*', default=None)
-    parser.add_argument('--save_masks', action='store_true')
-    parser.add_argument('--save_codebooks_per_group', action='store_true')
+    parser.add_argument('--checkpoint_every', type=int, default=4,
+                        help='每处理 N 层保存一次 checkpoint (默认 4)')
+    parser.add_argument('--resume', action='store_true',
+                        help='从 output_dir 中已有的 checkpoint 恢复')
     args = parser.parse_args()
 
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
@@ -474,7 +537,7 @@ def main():
     rbs_str = "整列共享" if args.row_block_size == -1 else f"{args.row_block_size} 行/块"
 
     print('=' * 70)
-    print('2:4 稀疏 + 共享指数量化 模型分析 (加速版)')
+    print('2:4 稀疏 + 共享指数量化 模型分析 (加速版, 带 checkpoint)')
     print('=' * 70)
     print(f'模型路径:        {args.model}')
     print(f'尾数位数:        {args.mantissa_bits}')
@@ -482,24 +545,30 @@ def main():
     print(f'跳过尾数量化:    {args.skip_mantissa_quant}')
     print(f'计算设备:        {device}')
     print(f'输出目录:        {args.output_dir}')
+    print(f'checkpoint间隔:  每 {args.checkpoint_every} 层')
     if args.layers is not None:
         print(f'只分析层:        {args.layers}')
     print()
-    print(f'共享维度:')
-    print(f'  列方向: 每4列 → 1 个 column_group')
-    print(f'  行方向: 每 {rbs_str} → 1 个 row_block')
-    print(f'  码表粒度: (column_group, row_block) 各有独立 D0/D1 码表')
-    print()
-    print(f'加速措施:')
-    print(f'  - C(n,4) combo 张量预生成 + GPU batch min/sum (消除 Python 循环)')
-    print(f'  - D0/D1 值 + log2 指数一次性批量预计算')
-    print(f'  - torch.unique 替代逐元素 Counter')
+    print(f'输出格式 (兼容 pack.py v2):')
+    print(f'  codebook_tables.pt : int8 [num_groups, num_rb, 2, 4]')
+    print(f'  sparse_masks.pt    : int8 [rows, num_groups, 2]')
     print()
 
     # 预热 combo 缓存
     for n in range(5, 13):
         get_combo_tensor(n, device)
     print(f'Combo 缓存已预热 (n=5..12, 设备={device})')
+
+    # ---- 尝试恢复 checkpoint ----
+    completed_layers = set()
+    all_sparsity = {}
+    all_patterns = {}
+    all_codebooks_pt = {}   # tensor_name → int8 tensor [G, RB, 2, 4]
+    all_masks_pt = {}       # tensor_name → int8 tensor [rows, G, 2]
+
+    if args.resume:
+        completed_layers, all_sparsity, all_patterns, all_codebooks_pt, all_masks_pt = \
+            load_checkpoint(args.output_dir)
 
     print('\n加载模型...')
     model = get_opt(args.model)
@@ -508,14 +577,16 @@ def main():
     num_layers = len(layers_list)
     print(f'模型层数: {num_layers}')
 
-    all_sparsity = {}
-    all_patterns = {}
-    all_codebooks = {}
-    all_masks = {}
     total_time = time.time()
+    layers_since_ckpt = 0  # 自上次 checkpoint 以来处理的层数
 
     for layer_idx in range(num_layers):
         if args.layers is not None and layer_idx not in args.layers:
+            continue
+
+        # 跳过已完成的层
+        if layer_idx in completed_layers:
+            print(f'\n  [跳过] Layer {layer_idx} (已在 checkpoint 中)')
             continue
 
         print(f'\n{"=" * 60}')
@@ -535,7 +606,7 @@ def main():
                 W = W.t()
 
             t_tensor = time.time()
-            sp_info, cb_info, pat_info, mask_t = analyze_tensor(
+            sp_info, cb_tensor, pat_info, mask_t = analyze_tensor(
                 full_name, W,
                 mantissa_bits=args.mantissa_bits,
                 row_block_size=args.row_block_size,
@@ -557,6 +628,10 @@ def main():
             if pat_info is not None:
                 all_patterns[full_name] = pat_info
 
+                # 存 codebook 和 mask (.pt, int8)
+                all_codebooks_pt[full_name] = cb_tensor.to(torch.int8).cpu()
+                all_masks_pt[full_name] = mask_t.to(torch.int8).cpu()
+
                 print(f"    D0 模式 (top 5):")
                 for pat, info in list(pat_info['d0_patterns'].items())[:5]:
                     ex = info['examples'][0]
@@ -570,45 +645,37 @@ def main():
                           f"  例: {ex['exponents']} "
                           f"(g={ex['group']}, rb={ex['row_block']})")
 
-            if args.save_codebooks_per_group and cb_info is not None:
-                cb_dict = {}
-                for (g, rb), val in cb_info.items():
-                    cb_dict[f"g{g}_rb{rb}"] = val
-                all_codebooks[full_name] = cb_dict
+        # 标记该层完成
+        completed_layers.add(layer_idx)
+        layers_since_ckpt += 1
 
-            if args.save_masks and mask_t is not None:
-                all_masks[full_name] = mask_t
+        # 定期 checkpoint
+        if layers_since_ckpt >= args.checkpoint_every:
+            save_checkpoint(args.output_dir, completed_layers,
+                            all_sparsity, all_patterns,
+                            all_codebooks_pt, all_masks_pt)
+            layers_since_ckpt = 0
 
+    # =================== 最终保存 ===================
     elapsed = time.time() - total_time
     print(f'\n\n总用时: {elapsed:.1f}s')
 
-    # =================== 保存 ===================
     print(f'\n{"=" * 60}')
-    print('保存结果')
+    print('保存最终结果')
     print(f'{"=" * 60}')
 
-    sparsity_path = os.path.join(args.output_dir, 'sparsity_check.json')
-    with open(sparsity_path, 'w', encoding='utf-8') as f:
-        json.dump(all_sparsity, f, indent=2, ensure_ascii=False)
-    print(f'  稀疏性检查 → {sparsity_path}')
+    # 最终 checkpoint (确保最后几层也被保存)
+    save_checkpoint(args.output_dir, completed_layers,
+                    all_sparsity, all_patterns,
+                    all_codebooks_pt, all_masks_pt)
 
-    pattern_path = os.path.join(args.output_dir, 'pattern_analysis.json')
-    with open(pattern_path, 'w', encoding='utf-8') as f:
-        json.dump(all_patterns, f, indent=2, ensure_ascii=False)
-    print(f'  模式分析   → {pattern_path}')
-
-    if args.save_codebooks_per_group:
-        cb_path = os.path.join(args.output_dir, 'codebook_tables.json')
-        with open(cb_path, 'w', encoding='utf-8') as f:
-            json.dump(all_codebooks, f, indent=2, ensure_ascii=False)
-        fsize = os.path.getsize(cb_path) / 1024 / 1024
-        print(f'  码表       → {cb_path} ({fsize:.1f} MB)')
-
-    if args.save_masks:
-        mask_path = os.path.join(args.output_dir, 'sparse_masks.pt')
-        torch.save(all_masks, mask_path)
-        fsize = os.path.getsize(mask_path) / 1024 / 1024
-        print(f'  Mask       → {mask_path} ({fsize:.1f} MB)')
+    # 打印文件大小
+    for fname in ['codebook_tables.pt', 'sparse_masks.pt',
+                   'sparsity_check.json', 'pattern_analysis.json']:
+        fpath = os.path.join(args.output_dir, fname)
+        if os.path.exists(fpath):
+            fsize = os.path.getsize(fpath) / 1024 / 1024
+            print(f'  {fname}: {fsize:.1f} MB')
 
     # =================== 汇总 ===================
     print(f'\n{"=" * 60}')

@@ -2,16 +2,20 @@
 2:4剪枝后的列交换优化 + 共享指数量化（预计算加速版）
 =========================================================
 与 opt_shared_exp_swap_swap.py 逻辑完全一致，但跳过两大耗时步骤：
-  1. 暴力枚举最优4指数 → 从 codebook_tables.json 查表
+  1. 暴力枚举最优4指数 → 从 codebook_tables.pt/.json 查表
   2. 交换决策计算       → 从 sparse_masks.pt 直接读取位置
+
+支持的预计算格式:
+  v2 (.pt): codebook_tables.pt  — dict{ name → int8 [G, RB, 2, 4] }
+  v1 (JSON): codebook_tables.json — dict{ name → { "g0_rb0": {"d0":..., "d1":...} } }
+  mask: sparse_masks.pt — dict{ name → int8 [rows, G, 2] }
 
 前置步骤:
   python test.py /path/to/pruned_model --mantissa_bits 4 \
-      --row_block_size 256 --save_codebooks_per_group --save_masks \
-      --output_dir /path/to/precomputed
+      --row_block_size 256 --output_dir /path/to/precomputed
 
 使用方法:
-  python opt_shared_exp_swap_quant.py /home/hej/model/float/stage1_pruned wikitext2 \
+  python opt_shared_exp_quant.py /home/hej/model/float/stage1_pruned wikitext2 \
       --base_model /home/hej/model/float/opt-6.7b --mantissa_bits 4 \
       --skip_mantissa_quant --row_block_size 256 \
       --precomputed_dir /home/hej/model/float/sparsegpt/compressed_256_4bits/mantissa_4bit
@@ -20,6 +24,7 @@
 import time
 import math
 import json
+import os
 from collections import Counter
 import torch
 import torch.nn as nn
@@ -33,60 +38,76 @@ torch.backends.cudnn.allow_tf32 = False
 
 
 # ======================================================================
-# 预计算数据加载器
+# 预计算数据加载器 (支持 v1 JSON + v2 .pt)
 # ======================================================================
 
 class PrecomputedLoader:
     """
-    加载 test.py 产出的 codebook_tables.json 和 sparse_masks.pt
+    加载 test.py 产出的 codebook 和 sparse_masks。
     
-    codebook_tables.json 格式:
-      { "layer0.self_attn.q_proj": { "g0_rb0": {"d0": [-7,-6,-5,-4], "d1": [-9,-8,-7,-6]}, ... }, ... }
-    
-    sparse_masks.pt 格式:
-      { "layer0.self_attn.q_proj": tensor[rows, num_groups, 2] int8 }
-      其中 dim2 = [pos_d0, pos_d1]，即大值和小值在4元素组内的位置
+    自动检测格式:
+      codebook_tables.pt  → v2: dict{ name → int8 tensor [G, RB, 2, 4] }
+      codebook_tables.json → v1: dict{ name → { "g0_rb0": {"d0":[...], "d1":[...]} } }
+      sparse_masks.pt → dict{ name → int8 tensor [rows, G, 2] }
     """
 
     def __init__(self, precomputed_dir):
-        self.codebooks = {}   # { tensor_name: { (g,rb): {"d0": [...], "d1": [...]} } }
-        self.masks = {}       # { tensor_name: tensor[rows, groups, 2] }
+        self.cb_format = None   # 'v1' or 'v2'
+        self.codebooks = {}
+        self.masks = {}
 
         # ---------- 加载码表 ----------
-        cb_path = f"{precomputed_dir}/codebook_tables.json"
-        print(f"  Loading codebook: {cb_path}")
-        with open(cb_path, 'r') as f:
-            raw_cb = json.load(f)
+        pt_path = os.path.join(precomputed_dir, 'codebook_tables.pt')
+        json_path = os.path.join(precomputed_dir, 'codebook_tables.json')
 
-        for tensor_name, entries in raw_cb.items():
-            parsed = {}
-            for key, val in entries.items():
-                # key = "g123_rb4" → (123, 4)
-                parts = key.split('_')
-                g = int(parts[0][1:])
-                rb = int(parts[1][2:])
-                parsed[(g, rb)] = val
-            self.codebooks[tensor_name] = parsed
-
-        print(f"    Loaded codebooks for {len(self.codebooks)} tensors")
+        if os.path.exists(pt_path):
+            self.cb_format = 'v2'
+            self.codebooks = torch.load(pt_path, map_location='cpu')
+            print(f"  Codebook format: v2 (.pt), {len(self.codebooks)} tensors")
+        elif os.path.exists(json_path):
+            self.cb_format = 'v1'
+            print(f"  Loading codebook: {json_path}")
+            with open(json_path, 'r') as f:
+                raw_cb = json.load(f)
+            for tensor_name, entries in raw_cb.items():
+                parsed = {}
+                for key, val in entries.items():
+                    parts = key.split('_')
+                    g = int(parts[0][1:])
+                    rb = int(parts[1][2:])
+                    parsed[(g, rb)] = val
+                self.codebooks[tensor_name] = parsed
+            print(f"    Loaded codebooks for {len(self.codebooks)} tensors")
+        else:
+            raise FileNotFoundError(
+                f"No codebook_tables.pt or .json in {precomputed_dir}")
 
         # ---------- 加载 mask ----------
-        mask_path = f"{precomputed_dir}/sparse_masks.pt"
+        mask_path = os.path.join(precomputed_dir, 'sparse_masks.pt')
         print(f"  Loading masks: {mask_path}")
         self.masks = torch.load(mask_path, map_location='cpu')
         print(f"    Loaded masks for {len(self.masks)} tensors")
 
     def get_codebook(self, tensor_name, g, rb):
-        """返回 (exp_d0_list, exp_d1_list)，每个是4个int的list"""
-        entry = self.codebooks[tensor_name][(g, rb)]
-        return entry['d0'], entry['d1']
+        """返回 (exp_d0_list, exp_d1_list)，每个是4个int的sorted list"""
+        if self.cb_format == 'v2':
+            t = self.codebooks[tensor_name]  # int8 [G, RB, 2, 4]
+            d0 = t[g, rb, 0, :].tolist()
+            d1 = t[g, rb, 1, :].tolist()
+            return sorted(d0), sorted(d1)
+        else:
+            entry = self.codebooks[tensor_name][(g, rb)]
+            return sorted(entry['d0']), sorted(entry['d1'])
 
     def get_mask(self, tensor_name):
         """返回 tensor[rows, num_groups, 2] int8，dim2=[pos_d0, pos_d1]"""
         return self.masks[tensor_name]
 
     def has_tensor(self, tensor_name):
-        return tensor_name in self.codebooks and tensor_name in self.masks
+        if self.cb_format == 'v2':
+            return tensor_name in self.codebooks and tensor_name in self.masks
+        else:
+            return tensor_name in self.codebooks and tensor_name in self.masks
 
 
 # ======================================================================
@@ -130,7 +151,6 @@ class SharedExpQuantizerPrecomputed:
         self.print_err = print_err
         self.current_layer_name = None
 
-        # 预计算数据（由外部注入）
         self.precomputed_loader = None
 
     def set_current_layer(self, layer_name):
@@ -213,25 +233,19 @@ class SharedExpQuantizerPrecomputed:
         num_rb = (rows + rbs - 1) // rbs if rbs > 0 else 1
 
         # ========================================================
-        # 关键改动1: 从预计算mask加载稀疏位置 → 替代 _recompute_swap_for_group
+        # 从预计算mask加载稀疏位置
         # ========================================================
-        # mask_tensor: [rows, num_groups, 2] int8, dim2 = [pos_d0, pos_d1]
-        # 这就是原版中 all_sm 的含义：每行每组的两个非零值位置
-        # pos_d0 = 大值（分配给D0码表），pos_d1 = 小值（分配给D1码表）
         mask_tensor = loader.get_mask(layer_name).to(device)
         all_sm = mask_tensor  # [rows, num_groups, 2]
 
-        # 有效性掩码：检查每行每组恰好2个非零
         W_g = W.reshape(rows, num_groups, 4)
         nz_cnt = (W_g != 0).sum(dim=2)
         all_vg = (nz_cnt == 2)
         stats['total_pairs'] = all_vg.sum().item()
 
         # ========================================================
-        # 关键改动2: 从预计算码表加载指数 → 替代 _select_shared_exp_from_block
+        # 从预计算码表加载指数
         # ========================================================
-        # all_exp_d0[r, g, :] = 该 (g, rb_of_r) 的D0码表（4个指数）
-        # all_exp_d1[r, g, :] = 该 (g, rb_of_r) 的D1码表（4个指数）
         all_exp_d0 = torch.zeros(rows, num_groups, 4, dtype=torch.float32, device=device)
         all_exp_d1 = torch.zeros(rows, num_groups, 4, dtype=torch.float32, device=device)
 
@@ -249,13 +263,7 @@ class SharedExpQuantizerPrecomputed:
                 all_exp_d1[:, g, :] = torch.tensor(ed1, dtype=torch.float32, device=device)
 
         # ========================================================
-        # 统计交换次数（mask中 pos_d0 != 原始排序位置 的即为交换）
-        # 这里简化处理：与原版保持统计兼容
-        # ========================================================
-        # （可选：如果需要精确swap统计，对比mask和原始位置排序即可）
-
-        # ========================================================
-        # 以下为标准GPTQ循环，与原版完全一致
+        # GPTQ循环
         # ========================================================
 
         nonzero_col_mask = (W != 0)
@@ -285,11 +293,6 @@ class SharedExpQuantizerPrecomputed:
                 if d == 0 or math.isnan(d):
                     d = 1.0
 
-                # ---- 确定每行用 D0 还是 D1 码表 ----
-                # all_sm[:, g, 0] = pos_d0 (大值位置)
-                # all_sm[:, g, 1] = pos_d1 (小值位置)
-                # 当前列 lc 如果是该行的大值位置 → 用 D0 码表
-                # 当前列 lc 如果是该行的小值位置 → 用 D1 码表
                 vg = all_vg[:, g]
                 sm0 = all_sm[:, g, 0]  # pos_d0
                 sm1 = all_sm[:, g, 1]  # pos_d1
@@ -300,7 +303,6 @@ class SharedExpQuantizerPrecomputed:
                 use_d0_mask = vg & is_s0
                 use_d1_mask = vg & is_s1
 
-                # 默认用 D0 码表，D1 位置的行覆盖为 D1 码表
                 per_row_exp = all_exp_d0[:, g, :].clone()
                 per_row_exp[use_d1_mask] = all_exp_d1[use_d1_mask, g, :]
 
@@ -317,7 +319,6 @@ class SharedExpQuantizerPrecomputed:
                 err1 = (w - q) / d
                 Err1[:, i] = err1
 
-                # GPTQ误差补偿
                 if Hinv1 is not None and i < count - 1:
                     ow = torch.where(overflow_col,
                                      torch.tensor(self.overflow_weight, device=device),
@@ -568,7 +569,6 @@ def opt_shared_exp_precomputed(model, dataloader, dev, args, precomputed_loader)
             full_name = f"layer{layer_idx}.{name}"
             print(f'\n  {full_name}')
 
-            # ---- 注入预计算数据 ----
             gpts[name].set_layer_name(full_name)
             gpts[name].set_precomputed(precomputed_loader)
 
@@ -706,14 +706,13 @@ def opt_eval(model, testenc, dev):
 
 if __name__ == '__main__':
     import argparse
-    import os
 
     parser = argparse.ArgumentParser()
     parser.add_argument('model', type=str, help='Path to pruned model')
     parser.add_argument('dataset', type=str, choices=['wikitext2', 'ptb', 'c4'])
     parser.add_argument('--base_model', type=str, required=True)
     parser.add_argument('--precomputed_dir', type=str, required=True,
-                        help='Path to test.py output (codebook_tables.json + sparse_masks.pt)')
+                        help='Path to test.py output (codebook_tables.pt + sparse_masks.pt)')
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--nsamples', type=int, default=128)
     parser.add_argument('--blocksize', type=int, default=128)
@@ -734,7 +733,6 @@ if __name__ == '__main__':
     print(f'Mantissa bits: {args.mantissa_bits}')
     print('=' * 70)
 
-    # ---- 加载预计算数据 ----
     print('\nLoading precomputed codebooks and masks...')
     precomputed_loader = PrecomputedLoader(args.precomputed_dir)
 

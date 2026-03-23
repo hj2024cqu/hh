@@ -1,30 +1,26 @@
 #!/bin/bash
-#2:4剪枝
-python opt.py facebook/opt-6.7b wikitext2 \
-    --prunen 2 --prunem 4 \
-    --save /home/hej/model/float/stage1_pruned
-
 # ======================================================================
 # 一键运行: test.py 预计算 + 量化
-# 修改下面的参数即可，路径和配置会自动传播
+# 全部输出为 .pt 格式 (int8), 兼容 pack.py v2 和 opt_shared_exp_quant.py
 # ======================================================================
 
 # -------------------- 路径参数 --------------------
-PRUNED_MODEL="/home/hej/model/float/stage1_pruned"       # 2:4剪枝后的模型路径
-BASE_MODEL="/home/hej/model/float/opt-6.7b"              # 用于加载tokenizer的基础模型路径（通常与pruned_model相同）
-OUTPUT_ROOT="/home/hej/model/float/sparsegpt"            # 量化结果的根目录，最终会在这里生成 compressed_{rbs}_4bits/mantissa_{MANTISSA_BITS}bit 这样的子目录
+PRUNED_MODEL="/home/hej/model/float/stage1_pruned"
+BASE_MODEL="/home/hej/model/float/opt-6.7b"
+OUTPUT_ROOT="/home/hej/model/float/sparsegpt"
 
 # -------------------- 量化参数 --------------------
-MANTISSA_BITS=4
+MANTISSA_BITS=3
 DATASET="wikitext2"
 SKIP_MANTISSA="--skip_mantissa_quant"   # 留空则不跳过: SKIP_MANTISSA=""
 
 # -------------------- row_block_size 列表 --------------------
-# -1 表示整列共享，会命名为 compressed_full_4bits
-# 正数会命名为 compressed_{rbs}_4bits
-# RBS_LIST=(-1 1024 512 256 128 64 32 16)
-# RBS_LIST=(-1)
-RBS_LIST=(128 64 32 16)
+RBS_LIST=(-1 )
+# RBS_LIST=(128 64 32 16)
+
+# -------------------- checkpoint --------------------
+CHECKPOINT_EVERY=4    # 每 N 层保存一次 checkpoint
+RESUME=true           # true 则自动从断点恢复
 
 # -------------------- 是否运行量化 --------------------
 RUN_QUANTIZE=true     # false 则只跑 test.py 预计算
@@ -57,10 +53,17 @@ for rbs in "${RBS_LIST[@]}"; do
 
     # ---- Step 1: test.py 预计算 ----
     echo "[Step 1] test.py 预计算..."
+
+    RESUME_ARG=""
+    if [ "${RESUME}" = true ]; then
+        RESUME_ARG="--resume"
+    fi
+
     python test.py "${PRUNED_MODEL}" \
         --mantissa_bits "${MANTISSA_BITS}" \
         --row_block_size "${rbs}" \
-        --save_codebooks_per_group --save_masks \
+        --checkpoint_every "${CHECKPOINT_EVERY}" \
+        ${RESUME_ARG} \
         --output_dir "${outdir}"
 
     if [ $? -ne 0 ]; then
