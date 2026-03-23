@@ -11,17 +11,18 @@ MANTISSA=3
 DATASET=wikitext2
 
 # ============================================================
-# 实验配置:  block_size  precomputed_dir  output_dir
+# 实验配置:  block_size | precomputed_dir | packed_output_dir
+#
+# precomputed_dir 必须与 test.sh 产出路径一致:
+#   ${ROOT}/compressed_${tag}_${MANTISSA}bits/mantissa_${MANTISSA}bit
+# 其中 tag: -1→full, 其余→数字本身
 # ============================================================
-#  full (-1) 的预计算目录比较特殊，单独列出
-#  其余三组路径规律一致
 
 declare -a CONFIGS=(
-    # row_block_size | precomputed_dir | packed_output_dir
-    # "-1|${ROOT}/compressed_full_10bits/mantissa_10|${ROOT}/compressed_full_3bits/mantissa_3/packed"
-    "1024|${ROOT}/compressed_1024_3bits/mantissa_3bit|${ROOT}/compressed_1024_3bits/mantissa_3/packed"
-    "512|${ROOT}/compressed_512_3bits/mantissa_3bit|${ROOT}/compressed_512_3bits/mantissa_3/packed"
-    "256|${ROOT}/compressed_256_3bits/mantissa_3bit|${ROOT}/compressed_256_3bits/mantissa_3/packed"
+    "-1|${ROOT}/compressed_full_${MANTISSA}bits/mantissa_${MANTISSA}bit|${ROOT}/compressed_full_${MANTISSA}bits/mantissa_${MANTISSA}bit/packed"
+    # "1024|${ROOT}/compressed_1024_${MANTISSA}bits/mantissa_${MANTISSA}bit|${ROOT}/compressed_1024_${MANTISSA}bits/mantissa_${MANTISSA}bit/packed"
+    # "512|${ROOT}/compressed_512_${MANTISSA}bits/mantissa_${MANTISSA}bit|${ROOT}/compressed_512_${MANTISSA}bits/mantissa_${MANTISSA}bit/packed"
+    # "256|${ROOT}/compressed_256_${MANTISSA}bits/mantissa_${MANTISSA}bit|${ROOT}/compressed_256_${MANTISSA}bits/mantissa_${MANTISSA}bit/packed"
 )
 
 # ============================================================
@@ -29,6 +30,12 @@ declare -a CONFIGS=(
 # ============================================================
 for cfg in "${CONFIGS[@]}"; do
     IFS='|' read -r BLOCK_SIZE PRECOMPUTED OUTPUT_DIR <<< "$cfg"
+
+    # 跳过预计算目录不存在的配置
+    if [ ! -d "${PRECOMPUTED}" ]; then
+        echo "[SKIP] ${PRECOMPUTED} 不存在, 跳过 block_size=${BLOCK_SIZE}"
+        continue
+    fi
 
     echo ""
     echo "######################################################################"
